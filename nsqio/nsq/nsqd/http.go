@@ -38,6 +38,8 @@ type httpServer struct {
 	router      http.Handler
 }
 
+//分别处理 tcp/http 请求，开启 handler 协程进行并发处理，其中 newHTTPServer 注册路由采用了 Decorate
+// 装饰器模式
 func newHTTPServer(ctx *context, tlsEnabled bool, tlsRequired bool) *httpServer {
 	log := http_api.Log(ctx.nsqd.logf)
 

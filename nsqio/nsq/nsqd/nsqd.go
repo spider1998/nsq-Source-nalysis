@@ -45,7 +45,7 @@ type NSQD struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	clientIDSequence int64			// 连接 nsqd tcp server 的 client 数目
 
-	sync.RWMutex
+	sync.RWMutex					//读写锁
 
 	opts atomic.Value				// nsqd 的配置文件
 
@@ -183,6 +183,7 @@ func New(opts *Options) (*NSQD, error) {
 	return n, nil
 }
 
+//获取配置数据
 func (n *NSQD) getOpts() *Options {
 	return n.opts.Load().(*Options)
 }
@@ -268,24 +269,32 @@ func (n *NSQD) Main() error {
 			exitCh <- err
 		})
 	}
-	//http端口通过WaitGroupWrapper的Wrap函数以goroutine方式启动主要的组件。
-	tcpServer := &tcpServer{ctx: ctx}
+	/*-------------------------------------------初始化TCP server---------------------------------------------------------*/
+	tcpServer := &tcpServer{ctx: ctx}	//自定义tcp server关联TCP处理函数
 	n.waitGroup.Wrap(func() {
 		exitFunc(protocol.TCPServer(n.tcpListener, tcpServer, n.logf))
 	})
+
+	/*-------------------------------------------初始化HTTP server---------------------------------------------------------*/
 	httpServer := newHTTPServer(ctx, false, n.getOpts().TLSRequired == TLSRequired)
 	n.waitGroup.Wrap(func() {
 		exitFunc(http_api.Serve(n.httpListener, httpServer, "HTTP", n.logf))
 	})
+
+	/*-------------------------------------------初始化HTTPS server---------------------------------------------------------*/
 	if n.tlsConfig != nil && n.getOpts().HTTPSAddress != "" {
 		httpsServer := newHTTPServer(ctx, true, true)
 		n.waitGroup.Wrap(func() {
 			exitFunc(http_api.Serve(n.httpsListener, httpsServer, "HTTPS", n.logf))
 		})
 	}
-
+	/*-------------------------------------------循环监控队列信息---------------------------------------------------------*/
 	n.waitGroup.Wrap(n.queueScanLoop)		//处理in-flight和deferred 优先级队列
+
+	/*-------------------------------------------节点信息管理---------------------------------------------------------*/
 	n.waitGroup.Wrap(n.lookupLoop)
+
+	/*-------------------------------------------统计信息输出---------------------------------------------------------*/
 	if n.getOpts().StatsdAddress != "" {
 		n.waitGroup.Wrap(n.statsdLoop)
 	}
@@ -335,7 +344,7 @@ func writeSyncFile(fn string, data []byte) error {
 	return err
 }
 
-//加载元数据文件
+//加载元数据文件（历史数据）
 //LoadMetadata 完成的就是 PersistMetadata 的镜像操作，从 dataPath + nsqd.dat 中读出存储的元数据，然后逐一恢复即可
 func (n *NSQD) LoadMetadata() error {
 	//初始化nsqd的LoadMetadata函数使用atomic包中的方法来保证方法执行前和执行后isLoading值的改变

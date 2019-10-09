@@ -1,4 +1,4 @@
-//定义了 nsqd tcp server 的 IOLoop，提供了 IDENTIFY、SUB 等请求的 handler 函数，
+//定义了 nsqd tcp server V2协议的 IOLoop，提供了 IDENTIFY、SUB 等请求的 handler 函数，
 // 同时实现了 messagePump 用于将 channel 中的 message push 给 consumer
 package nsqd
 
@@ -37,6 +37,9 @@ type protocolV2 struct {
 
 //类似理解为 http 服务中的 router。当 client 通过 tcp 连接上 nsqd 之后，
 // 启动一个 IOLoop，接收 client 的 tcp 请求，解析后然后分配给不同的 handler 执行
+//
+//通过内部协议进行 p.Exec(执行命令)、p.Send(发送结果)，保证每个 nsqd 节点都能正确的进行消息生成与消费，
+// 一旦上述过程有 error 都会被捕获处理，确保分布式投递的可靠性。
 func (p *protocolV2) IOLoop(conn net.Conn) error {
 	var err error
 	var line []byte
@@ -52,6 +55,8 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 	// and avoid a potential race with IDENTIFY (where a client
 	// could have changed or disabled said attributes)
 	messagePumpStartedChan := make(chan bool)
+
+	/*---------------------从该client订阅的channel的clientMsgChan中读取消息并发送给client：-----------------------------*/
 	go p.messagePump(client, messagePumpStartedChan)	//push多条消息
 	<-messagePumpStartedChan
 
@@ -75,7 +80,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 			}
 			break
 		}
-
+		//解析命令参数
 		// trim the '\n'
 		line = line[:len(line)-1]
 		// optionally trim the '\r'
@@ -85,7 +90,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 		params := bytes.Split(line, separatorBytes)
 
 		p.ctx.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): [%s] %s", client, params)
-
+		/*-----------------------------通过内部协议进行 p.Exec(执行命令)----------------------------------------------*/
 		var response []byte
 		response, err = p.Exec(client, params)		//调用相应的handler处理tcp请求
 		if err != nil {
@@ -94,7 +99,6 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 				ctx = " - " + parentErr.Error()
 			}
 			p.ctx.nsqd.logf(LOG_ERROR, "[%s] - %s%s", client, err, ctx)
-
 			sendErr := p.Send(client, frameTypeError, []byte(err.Error()))
 			if sendErr != nil {
 				p.ctx.nsqd.logf(LOG_ERROR, "[%s] - %s%s", client, sendErr, ctx)
@@ -107,7 +111,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 			}
 			continue
 		}
-
+		/*-----------------------------p.Send发送结果----------------------------------------------*/
 		if response != nil {
 			err = p.Send(client, frameTypeResponse, response)
 			if err != nil {
@@ -131,12 +135,12 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 func (p *protocolV2) SendMessage(client *clientV2, msg *Message) error {
 	p.ctx.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): writing msg(%s) to client(%s) - %s", msg.ID, client, msg.Body)
 	var buf = &bytes.Buffer{}
-
+	//msg写入到buf
 	_, err := msg.WriteTo(buf)
 	if err != nil {
 		return err
 	}
-
+	//buf里面写入client,此时并不是走网络Write了，而是先写入client.Writer的buffer里面去了
 	err = p.Send(client, frameTypeMessage, buf.Bytes())
 	if err != nil {
 		return err
@@ -147,7 +151,7 @@ func (p *protocolV2) SendMessage(client *clientV2, msg *Message) error {
 
 func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error {
 	client.writeLock.Lock()
-
+	//设置超时时间,心跳的频率和超时时间有关系
 	var zeroTime time.Time
 	if client.HeartbeatInterval > 0 {
 		client.SetWriteDeadline(time.Now().Add(client.HeartbeatInterval))
@@ -155,12 +159,13 @@ func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error 
 		client.SetWriteDeadline(zeroTime)
 	}
 
+	//只是写入到buffer里面去了
 	_, err := protocol.SendFramedResponse(client.Writer, frameType, data)
 	if err != nil {
 		client.writeLock.Unlock()
 		return err
 	}
-
+	//不是消息类型的时候flush,走网络
 	if frameType != frameTypeMessage {
 		err = client.Flush()
 	}
@@ -172,6 +177,7 @@ func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error 
 
 //TCP的router
 func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
+	//身份识别
 	if bytes.Equal(params[0], []byte("IDENTIFY")) {
 		return p.IDENTIFY(client, params)
 	}
@@ -180,27 +186,27 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 		return nil, err
 	}
 	switch {
-	case bytes.Equal(params[0], []byte("FIN")):
+	case bytes.Equal(params[0], []byte("FIN"))://完成一个消息 (表示成功处理)
 		return p.FIN(client, params)
-	case bytes.Equal(params[0], []byte("RDY")):
+	case bytes.Equal(params[0], []byte("RDY"))://更新 RDY 状态 (表示你已经准备好接收N 消息)
 		return p.RDY(client, params)
-	case bytes.Equal(params[0], []byte("REQ")):
+	case bytes.Equal(params[0], []byte("REQ"))://重新将消息队列（表示处理失败）
 		return p.REQ(client, params)
-	case bytes.Equal(params[0], []byte("PUB")):
+	case bytes.Equal(params[0], []byte("PUB")):	//发布一个消息到 话题（topic):
 		return p.PUB(client, params)
-	case bytes.Equal(params[0], []byte("MPUB")):
+	case bytes.Equal(params[0], []byte("MPUB"))://发布多个消息到 话题（topic) (自动):
 		return p.MPUB(client, params)
-	case bytes.Equal(params[0], []byte("DPUB")):
+	case bytes.Equal(params[0], []byte("DPUB"))://延时发布消息
 		return p.DPUB(client, params)
-	case bytes.Equal(params[0], []byte("NOP")):
+	case bytes.Equal(params[0], []byte("NOP"))://无响应（心跳回复）
 		return p.NOP(client, params)
-	case bytes.Equal(params[0], []byte("TOUCH")):
+	case bytes.Equal(params[0], []byte("TOUCH"))://重置传播途中的消息超时时间
 		return p.TOUCH(client, params)
-	case bytes.Equal(params[0], []byte("SUB")):
+	case bytes.Equal(params[0], []byte("SUB")):	//订阅话题（topic) /通道（channel)
 		return p.SUB(client, params)
-	case bytes.Equal(params[0], []byte("CLS")):
+	case bytes.Equal(params[0], []byte("CLS"))://清除连接（不再发送消息）
 		return p.CLS(client, params)
-	case bytes.Equal(params[0], []byte("AUTH")):
+	case bytes.Equal(params[0], []byte("AUTH"))://验证客户端身份
 		return p.AUTH(client, params)
 	}
 	return nil, protocol.NewFatalClientErr(nil, "E_INVALID", fmt.Sprintf("invalid command %s", params[0]))
@@ -217,17 +223,28 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 // 新的 param 作出相应的更改；当 memoryMsgChan 和 backendMsgChan 赢得竞争的时候，消费一条消息
 func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var err error
+	//内存的MsgChan
 	var memoryMsgChan chan *Message
+	//文件的MsgChan
 	var backendMsgChan chan []byte
+	//订阅的频道
 	var subChannel *Channel
 	// NOTE: `flusherChan` is used to bound message latency for
 	// the pathological case of a channel on a low volume topic
 	// with >1 clients having >1 RDY counts
+	//数据刷新ticker
 	var flusherChan <-chan time.Time
+	//客户端读取数据速率
 	var sampleRate int32
 
+	//client的配置
+
+
+	//client订阅的subChan，方便给subChannel赋值相应的channel
 	subEventChan := client.SubEventChan
+	//鉴权Identify对应的chan，只能鉴权一次
 	identifyEventChan := client.IdentifyEventChan
+	//flushChan赋值outputBufferTicker,默认是250ms时间间隔Flush一次数据
 	outputBufferTicker := time.NewTicker(client.OutputBufferTimeout)
 	heartbeatTicker := time.NewTicker(client.HeartbeatInterval)
 	heartbeatChan := heartbeatTicker.C
@@ -243,16 +260,19 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 
 	// signal to the goroutine that started the messagePump
 	// that we've started up
+	//已经准备好了messagePump的时候关闭chan,阻塞在读chan的就会执行完
 	close(startedChan)
 
 	for {
 		if subChannel == nil || !client.IsReadyForMessages() {
+			//客户端没有订阅频道，客户端没有准备好读消息，消息Pause,UnPause，消息读取Timeout的时候都有可能触发条件
+			//从而导致client盲等待
 			// the client is not ready to receive messages...
 			// client 还没有准备好获取消息
 			memoryMsgChan = nil
 			backendMsgChan = nil
 			flusherChan = nil
-			// force flush
+			// 强制刷新数据到缓冲区
 			client.writeLock.Lock()
 			err = client.Flush()
 			client.writeLock.Unlock()

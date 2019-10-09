@@ -1,3 +1,4 @@
+//判断topic名称是否合法
 package protocol
 
 import (

@@ -15,7 +15,7 @@ type TCPHandler interface {
 
 func TCPServer(listener net.Listener, handler TCPHandler, logf lg.AppLogFunc) error {
 	logf(lg.INFO, "TCP: listening on %s", listener.Addr())
-
+	/*-------------------------------------------------tcp-handler 处理------------------------------------------------*/
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {

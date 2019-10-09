@@ -1,3 +1,4 @@
+//nsqd服务TCP处理函数
 package nsqd
 
 import (
@@ -11,12 +12,13 @@ type tcpServer struct {
 	ctx *context
 }
 //nsqd TCP处理函数
+//tcp 解析 V2 协议，走内部协议封装的 prot.IOLoop(conn) 进行处理
 func (p *tcpServer) Handle(clientConn net.Conn) {
 	p.ctx.nsqd.logf(LOG_INFO, "TCP: new client(%s)", clientConn.RemoteAddr())
 
-	// The client should initialize itself by sending a 4 byte sequence indicating
-	// the version of the protocol that it intends to communicate, this will allow us
-	// to gracefully upgrade the protocol away from text/line oriented to whatever...
+	//客户端应通过发送一个4字节的序列来初始化自身，该序列指示
+	//它打算传达的协议版本，这将使我们
+	//将协议从文本/行优雅地升级到其他任何版本...
 	buf := make([]byte, 4)
 	_, err := io.ReadFull(clientConn, buf)
 	if err != nil {
@@ -31,7 +33,7 @@ func (p *tcpServer) Handle(clientConn net.Conn) {
 
 	var prot protocol.Protocol
 	switch protocolMagic {
-	case "  V2":
+	case "  V2":		//v2协议
 		prot = &protocolV2{ctx: p.ctx}
 	default:
 		protocol.SendFramedResponse(clientConn, frameTypeError, []byte("E_BAD_PROTOCOL"))

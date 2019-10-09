@@ -111,7 +111,7 @@ func NewOptions() *Options {
 		HTTPClientConnectTimeout: 2 * time.Second,
 		HTTPClientRequestTimeout: 5 * time.Second,
 
-		MemQueueSize:    10000,
+		MemQueueSize:    10000,		//最大写入内存容量（大于此值后写入磁盘）
 		MaxBytesPerFile: 100 * 1024 * 1024,
 		SyncEvery:       2500,
 		SyncTimeout:     2 * time.Second,
